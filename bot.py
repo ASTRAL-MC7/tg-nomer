@@ -3,6 +3,7 @@ import asyncio
 import logging
 import aiohttp
 import aiosqlite
+import asyncpg
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
@@ -26,9 +27,16 @@ API_KEY = os.getenv("KOMETA_API_KEY", "141aecd4c1f44ca10b95ef63c608605b2e527388"
 API_URL = "https://kometa-smm.uz/number_api"
 DB_NAME = "database.db"
 
-STAR_PRICE_UZS = 165  # 10 Stars = 1,650 UZS
-EXTRA_MARGIN = 5000   # Har bir raqam narxiga +5000 so'm ustama
-ITEMS_PER_PAGE = 8    # Har bir sahifada 8 tadan davlat
+# Narx va bonus sozlamalari
+STAR_PRICE_UZS = 165   # 10 Stars = 1,650 UZS
+EXTRA_MARGIN = 3000    # Har bir raqam narxiga +3000 so'm ustama
+INITIAL_BONUS = 2000   # Yangi foydalanuvchiga ilk kirish bonusi
+ITEMS_PER_PAGE = 8     # Har bir sahifada 8 tadan davlat
+
+# PostgreSQL URL tekshiruvi (Render uchun moslashtirish)
+DATABASE_URL = os.getenv("DATABASE_URL")
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -38,41 +46,88 @@ class UserStates(StatesGroup):
     waiting_for_stars = State()
     waiting_for_broadcast = State()
 
-# ================== MA'LUMOTLAR BAZASI ==================
+# ================== BAZA BILAN ISHLASH ==================
 async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("""
+    if DATABASE_URL:
+        conn = await asyncpg.connect(DATABASE_URL)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                balance INTEGER DEFAULT 0
-            )
+                user_id BIGINT PRIMARY KEY,
+                balance BIGINT DEFAULT 0
+            );
         """)
-        await db.commit()
+        await conn.close()
+    else:
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    balance INTEGER DEFAULT 0
+                )
+            """)
+            await db.commit()
+
+async def get_or_create_user(user_id: int):
+    """Foydalanuvchini oladi yoki yangi bo'lsa 2000 so'm bonus beradi"""
+    if DATABASE_URL:
+        conn = await asyncpg.connect(DATABASE_URL)
+        row = await conn.fetchrow("SELECT balance FROM users WHERE user_id = $1", user_id)
+        if row:
+            bal = row["balance"]
+            is_new = False
+        else:
+            await conn.execute("INSERT INTO users (user_id, balance) VALUES ($1, $2)", user_id, INITIAL_BONUS)
+            bal = INITIAL_BONUS
+            is_new = True
+        await conn.close()
+        return bal, is_new
+    else:
+        async with aiosqlite.connect(DB_NAME) as db:
+            cursor = await db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+            row = await cursor.fetchone()
+            if row:
+                bal = row[0]
+                is_new = False
+            else:
+                await db.execute("INSERT INTO users (user_id, balance) VALUES (?, ?)", (user_id, INITIAL_BONUS))
+                await db.commit()
+                bal = INITIAL_BONUS
+                is_new = True
+            return bal, is_new
 
 async def get_user_balance(user_id: int) -> int:
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
-        row = await cursor.fetchone()
-        if row:
-            return row[0]
-        await db.execute("INSERT INTO users (user_id, balance) VALUES (?, 0)", (user_id,))
-        await db.commit()
-        return 0
+    bal, _ = await get_or_create_user(user_id)
+    return bal
 
 async def update_user_balance(user_id: int, amount: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("""
-            INSERT INTO users (user_id, balance) VALUES (?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?
-        """, (user_id, amount, amount))
-        await db.commit()
+    if DATABASE_URL:
+        conn = await asyncpg.connect(DATABASE_URL)
+        await conn.execute("""
+            INSERT INTO users (user_id, balance) VALUES ($1, $2)
+            ON CONFLICT (user_id) 
+            DO UPDATE SET balance = users.balance + $2
+        """, user_id, amount)
+        await conn.close()
+    else:
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute("""
+                INSERT INTO users (user_id, balance) VALUES (?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?
+            """, (user_id, amount, amount))
+            await db.commit()
 
 async def get_all_users():
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT user_id FROM users")
-        return await cursor.fetchall()
+    if DATABASE_URL:
+        conn = await asyncpg.connect(DATABASE_URL)
+        rows = await conn.fetch("SELECT user_id FROM users")
+        await conn.close()
+        return [(r["user_id"],) for r in rows]
+    else:
+        async with aiosqlite.connect(DB_NAME) as db:
+            cursor = await db.execute("SELECT user_id FROM users")
+            return await cursor.fetchall()
 
-# ================== KOMETA API HANDLER ==================
+# ================== API SO'ROV FUNKSIYASI ==================
 async def api_request(action: str, extra_params: dict = None):
     params = {"key": API_KEY, "action": action}
     if extra_params:
@@ -89,7 +144,7 @@ async def api_request(action: str, extra_params: dict = None):
         logging.error(f"API Error ({action}): {e}")
         return None
 
-# ================== MENULAR ==================
+# ================== ASOSIY MENYU ==================
 def main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📱 Raqam sotib olish", callback_data="buy_number")],
@@ -104,13 +159,20 @@ def main_menu():
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    await get_user_balance(message.from_user.id)
-    await message.answer(
-        f"Assalomu alaykum, {message.from_user.first_name}!\n\n"
+    balance, is_new = await get_or_create_user(message.from_user.id)
+    
+    welcome_text = f"Assalomu alaykum, {message.from_user.first_name}!\n\n"
+    if is_new:
+        welcome_text += (
+            "🎉 <b>Xush kelibsiz!</b>\n"
+            f"Sizga ilk kirishingiz uchun <b>+{INITIAL_BONUS:,} so'm</b> bonus berildi!\n\n"
+        )
+    welcome_text += (
         "Virtual raqamlar xarid qilish botiga xush kelibsiz.\n"
-        "Quyidagi menyu orqali kerakli bo'limni tanlang:",
-        reply_markup=main_menu()
+        f"💳 Joriy balansingiz: <b>{balance:,} so'm</b>\n\n"
+        "Quyidagi menyu orqali kerakli bo'limni tanlang:"
     )
+    await message.answer(welcome_text, parse_mode="HTML", reply_markup=main_menu())
 
 @dp.callback_query(F.data == "back_main")
 async def back_main(call: CallbackQuery, state: FSMContext):
@@ -126,16 +188,16 @@ async def balance_handler(call: CallbackQuery):
     ])
     await call.message.edit_text(f"💳 Sizning balansingiz: <b>{bal:,} so'm</b>", parse_mode="HTML", reply_markup=kb)
 
-# ================== STARS TO'LOV TIZIMI ==================
+# ================== TELEGRAM STARS ORQALI TO'LOV ==================
 @dp.callback_query(F.data == "top_up")
 async def top_up_stars(call: CallbackQuery, state: FSMContext):
     await state.set_state(UserStates.waiting_for_stars)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Bekor qilish", callback_data="back_main")]])
     await call.message.edit_text(
         "⭐ <b>Telegram Stars orqali hisob to'ldirish</b>\n\n"
-        "Kurs: <b>10 Stars = 1,650 so'm</b>\n"
+        "Kurs: <b>10 Stars = 1,650 so'm</b> (1 Star = 165 so'm)\n"
         "Minimal to'lov: <b>10 Stars</b>\n\n"
-        "Qancha Stars to'lamoqchisiz? Sonini yozing (Masalan: 10, 50, 100):",
+        "Qancha Stars to'lamoqchisiz? Sonini yozib yuboring (Masalan: 10, 50, 100):",
         parse_mode="HTML",
         reply_markup=kb
     )
@@ -175,14 +237,14 @@ async def successful_pay(message: Message):
         await update_user_balance(message.from_user.id, amount_uzs)
         bal = await get_user_balance(message.from_user.id)
         await message.answer(
-            f"✅ To'lov qabul qilindi!\n"
+            f"✅ To'lov muvaffaqiyatli qabul qilindi!\n"
             f"Hisobingizga <b>+{amount_uzs:,} so'm</b> qo'shildi.\n"
             f"Joriy balans: <b>{bal:,} so'm</b>",
             parse_mode="HTML",
             reply_markup=main_menu()
         )
 
-# ================== RAQAM SOTIB OLISH VA SAHIFALASH ==================
+# ================== RAQAM SOTIB OLISH (PAGINATION) ==================
 @dp.callback_query(F.data.startswith("countries_page_"))
 @dp.callback_query(F.data == "buy_number")
 async def list_countries(call: CallbackQuery):
@@ -223,12 +285,11 @@ async def list_countries(call: CallbackQuery):
         code = item.get("code")
         name = item.get("name", code)
         base_price = float(item.get("price", 0))
-        final_price = int(base_price + EXTRA_MARGIN)
+        final_price = int(base_price + EXTRA_MARGIN)  # +3000 so'm qo'shiladi
 
         btn_text = f"{name} — {final_price:,} so'm"
         buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"buy_{code}_{final_price}")])
 
-    # Navigatsiya tugmalari
     nav_buttons = []
     if page > 0:
         nav_buttons.append(InlineKeyboardButton(text="⬅️ Oldingi", callback_data=f"countries_page_{page - 1}"))
@@ -285,7 +346,7 @@ async def order_number(call: CallbackQuery):
         f"✅ <b>Raqam muvaffaqiyatli olindi!</b>\n\n"
         f"📞 <b>Raqam:</b> <code>{number}</code>\n"
         f"🔑 <b>Hash:</b> <code>{order_hash}</code>\n\n"
-        f"⏳ <b>SMS kutilmoqda...</b> (Har 10 soniyada avtomatik yangilanadi)"
+        f"⏳ <b>SMS kutilmoqda...</b> (Har 10 soniyada avtomatik tekshiriladi)"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 SMS tekshirish", callback_data=f"chk_{order_hash}")],
@@ -334,7 +395,7 @@ async def manual_check(call: CallbackQuery):
 
     if code:
         await call.message.reply(f"📩 <b>SMS Kod:</b> <code>{code}</code>", parse_mode="HTML")
-        await call.answer("Kod keldi!")
+        await call.answer("Kod yetib keldi!")
     else:
         await call.answer("⏳ SMS hali kelmadi, kutilmoqda...", show_alert=True)
 
@@ -424,7 +485,7 @@ async def process_broadcast_msg(message: Message, state: FSMContext):
 
     await st.edit_text(f"✅ Yuborildi: {sent} ta\n❌ Yetib bormadi: {failed} ta")
 
-# ================== RENDER UCHUN WEB SERVER ==================
+# ================== RENDER PORT UCHUN MINI SERVER ==================
 async def start_dummy_server():
     async def ping_handler(req):
         return web.Response(text="Bot is running!")
@@ -436,13 +497,13 @@ async def start_dummy_server():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logging.info(f"Health check server {port}-portda ishga tushdi")
+    logging.info(f"Health check server {port}-portda ishga tushirildi")
 
 # ================== ASOSIY RUNNER ==================
 async def main():
     await init_db()
     await start_dummy_server()
-    logging.info("Bot polling holatida ishga tushirildi...")
+    logging.info("Bot muvaffaqiyatli ishga tushdi!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
