@@ -26,8 +26,9 @@ ADMIN_ID = 5523761749
 API_KEY = os.getenv("KOMETA_API_KEY", "141aecd4c1f44ca10b95ef63c608605b2e527388")
 API_URL = "https://kometa-smm.uz/number_api"
 DB_NAME = "database.db"
+TABLE_NAME = "tg_number_users"
 
-# Narx va bonus sozlamalari
+# Narx va bonus parametrlari
 STAR_PRICE_UZS = 165   # 10 Stars = 1,650 UZS
 EXTRA_MARGIN = 3000    # Har bir raqam narxiga +3000 so'm ustama
 INITIAL_BONUS = 2000   # Yangi foydalanuvchiga ilk kirish bonusi
@@ -50,8 +51,8 @@ class UserStates(StatesGroup):
 async def init_db():
     if DATABASE_URL:
         conn = await asyncpg.connect(DATABASE_URL)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
+        await conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
                 user_id BIGINT PRIMARY KEY,
                 balance BIGINT DEFAULT 0
             );
@@ -59,8 +60,8 @@ async def init_db():
         await conn.close()
     else:
         async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS users (
+            await db.execute(f"""
+                CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
                     user_id INTEGER PRIMARY KEY,
                     balance INTEGER DEFAULT 0
                 )
@@ -71,25 +72,25 @@ async def get_or_create_user(user_id: int):
     """Foydalanuvchini oladi yoki yangi bo'lsa 2000 so'm bonus beradi"""
     if DATABASE_URL:
         conn = await asyncpg.connect(DATABASE_URL)
-        row = await conn.fetchrow("SELECT balance FROM users WHERE user_id = $1", user_id)
+        row = await conn.fetchrow(f"SELECT balance FROM {TABLE_NAME} WHERE user_id = $1", user_id)
         if row:
             bal = row["balance"]
             is_new = False
         else:
-            await conn.execute("INSERT INTO users (user_id, balance) VALUES ($1, $2)", user_id, INITIAL_BONUS)
+            await conn.execute(f"INSERT INTO {TABLE_NAME} (user_id, balance) VALUES ($1, $2)", user_id, INITIAL_BONUS)
             bal = INITIAL_BONUS
             is_new = True
         await conn.close()
         return bal, is_new
     else:
         async with aiosqlite.connect(DB_NAME) as db:
-            cursor = await db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+            cursor = await db.execute(f"SELECT balance FROM {TABLE_NAME} WHERE user_id = ?", (user_id,))
             row = await cursor.fetchone()
             if row:
                 bal = row[0]
                 is_new = False
             else:
-                await db.execute("INSERT INTO users (user_id, balance) VALUES (?, ?)", (user_id, INITIAL_BONUS))
+                await db.execute(f"INSERT INTO {TABLE_NAME} (user_id, balance) VALUES (?, ?)", (user_id, INITIAL_BONUS))
                 await db.commit()
                 bal = INITIAL_BONUS
                 is_new = True
@@ -102,16 +103,16 @@ async def get_user_balance(user_id: int) -> int:
 async def update_user_balance(user_id: int, amount: int):
     if DATABASE_URL:
         conn = await asyncpg.connect(DATABASE_URL)
-        await conn.execute("""
-            INSERT INTO users (user_id, balance) VALUES ($1, $2)
+        await conn.execute(f"""
+            INSERT INTO {TABLE_NAME} (user_id, balance) VALUES ($1, $2)
             ON CONFLICT (user_id) 
-            DO UPDATE SET balance = users.balance + $2
+            DO UPDATE SET balance = {TABLE_NAME}.balance + $2
         """, user_id, amount)
         await conn.close()
     else:
         async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("""
-                INSERT INTO users (user_id, balance) VALUES (?, ?)
+            await db.execute(f"""
+                INSERT INTO {TABLE_NAME} (user_id, balance) VALUES (?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?
             """, (user_id, amount, amount))
             await db.commit()
@@ -119,12 +120,12 @@ async def update_user_balance(user_id: int, amount: int):
 async def get_all_users():
     if DATABASE_URL:
         conn = await asyncpg.connect(DATABASE_URL)
-        rows = await conn.fetch("SELECT user_id FROM users")
+        rows = await conn.fetch(f"SELECT user_id FROM {TABLE_NAME}")
         await conn.close()
         return [(r["user_id"],) for r in rows]
     else:
         async with aiosqlite.connect(DB_NAME) as db:
-            cursor = await db.execute("SELECT user_id FROM users")
+            cursor = await db.execute(f"SELECT user_id FROM {TABLE_NAME}")
             return await cursor.fetchall()
 
 # ================== API SO'ROV FUNKSIYASI ==================
@@ -285,7 +286,7 @@ async def list_countries(call: CallbackQuery):
         code = item.get("code")
         name = item.get("name", code)
         base_price = float(item.get("price", 0))
-        final_price = int(base_price + EXTRA_MARGIN)  # +3000 so'm qo'shiladi
+        final_price = int(base_price + EXTRA_MARGIN)
 
         btn_text = f"{name} — {final_price:,} so'm"
         buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"buy_{code}_{final_price}")])
